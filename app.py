@@ -1,65 +1,122 @@
 import streamlit as st
 import pandas as pd
 import requests
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from pyspark.sql import SparkSession
+from pyspark.ml.feature import Tokenizer, HashingTF, IDF
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+import nltk
+import altair as alt
+import time
 
-# ------------------------
+# Download VADER lexicon
+nltk.download("vader_lexicon", quiet=True)
+
+# Cache Spark session
+@st.cache_resource
+def init_spark():
+    return SparkSession.builder \
+        .appName("NewsSentimentApp") \
+        .master("local[*]") \
+        .config("spark.ui.showConsoleProgress", "false") \
+        .getOrCreate()
+
+spark = init_spark()
+
+# API Key from secrets
+API_KEY = "65af9d35def2491cbf609f0916e0dabf"
+
+# Fetch latest news
+def get_news(query, limit=5):
+    url = f"https://newsapi.org/v2/everything?q={query}&pageSize={limit}&sortBy=publishedAt&apiKey={API_KEY}"
+    resp = requests.get(url).json()
+    articles = resp.get("articles", [])
+    return pd.DataFrame([{"headline": a["title"]} for a in articles if a.get("title")])
+
+# Sentiment with VADER
+def add_sentiment(df):
+    sia = SentimentIntensityAnalyzer()
+    def classify(text):
+        score = sia.polarity_scores(text)["compound"]
+        return "Positive" if score > 0.05 else "Negative" if score < -0.05 else "Neutral"
+    df["sentiment"] = df["headline"].apply(classify)
+    df["label"] = df["sentiment"].map({"Positive": 2.0, "Neutral": 1.0, "Negative": 0.0})
+    return df
+
 # Streamlit UI
-# ------------------------
-st.set_page_config(page_title="Real-Time News Sentiment", layout="wide")
-st.title("📰 Real-Time News Sentiment Dashboard")
+st.set_page_config(page_title="AI News Sentiment", page_icon="📰", layout="wide")
+st.title("📰 News Sentiment Dashboard with PySpark")
 
-# Refresh interval in milliseconds (Streamlit autorefresh)
-REFRESH_INTERVAL = 30 * 1000  # 30 seconds
-st_autorefresh = st.experimental_autorefresh(interval=REFRESH_INTERVAL, key="refresh")
+query = st.text_input("Enter Topic", "Artificial Intelligence")
+mode = st.radio("Choose Mode", ["Train Model", "Predict Sentiment"], horizontal=True)
+limit = st.slider("Number of Articles", 3, 20, 8)
 
-# GNews API Key
-API_KEY = "API_KEY"  # <-- Replace with your key
-URL = f"https://gnews.io/api/v4/top-headlines?country=in&max=10&apikey={API_KEY}"
+if st.button("Run Analysis"):
+    news_df = get_news(query, limit)
+    if news_df.empty:
+        st.warning("No news articles found.")
+    else:
+        if mode == "Train Model":
+            news_df = add_sentiment(news_df)
+            spark_df = spark.createDataFrame(news_df)
 
-# Initialize VADER
-analyzer = SentimentIntensityAnalyzer()
+            # Pipeline
+            tokenizer = Tokenizer(inputCol="headline", outputCol="tokens")
+            tokenized = tokenizer.transform(spark_df)
 
-# Sentiment function
-def get_sentiment(text: str) -> str:
-    score = analyzer.polarity_scores(text)["compound"]
-    return "Positive" if score >= 0 else "Negative"
+            hashing = HashingTF(inputCol="tokens", outputCol="tf")
+            tf_data = hashing.transform(tokenized)
 
-# Function to color-code sentiment
-def color_sentiment(val: str) -> str:
-    return f"color: {'green' if val == 'Positive' else 'red'}"
+            idf = IDF(inputCol="tf", outputCol="features").fit(tf_data)
+            final_data = idf.transform(tf_data)
 
-# ------------------------
-# Fetch and Process News
-# ------------------------
-try:
-    response = requests.get(URL, timeout=10)
-    data = response.json()
-    articles = data.get("articles", [])
-except Exception as e:
-    st.error(f"Error fetching news: {e}")
-    articles = []
+            lr = LogisticRegression(maxIter=10, regParam=0.001)
+            model = lr.fit(final_data)
 
-if articles:
-    df = pd.DataFrame(articles)
+            acc = MulticlassClassificationEvaluator(
+                labelCol="label", predictionCol="prediction", metricName="accuracy"
+            ).evaluate(model.transform(final_data))
 
-    # Ensure description column exists
-    if "description" not in df.columns:
-        df["description"] = ""
+            # Save in session
+            st.session_state.update({
+                "model": model, "tokenizer": tokenizer,
+                "hashing": hashing, "idf": idf
+            })
 
-    # Combine title + description
-    df["full_text"] = df["title"].fillna("") + " " + df["description"].fillna("")
-    df["sentiment"] = df["full_text"].apply(get_sentiment)
+            st.success(f"Model trained successfully! ✅ Accuracy: {acc:.2%}")
+            st.dataframe(news_df[["headline", "sentiment"]])
 
-    # Display styled dataframe
-    st.subheader("Latest News with Sentiment")
-    styled_df = df[["title", "sentiment"]].style.applymap(color_sentiment, subset=["sentiment"])
-    st.dataframe(styled_df, use_container_width=True)
+        elif mode == "Predict Sentiment":
+            if "model" not in st.session_state:
+                st.error("Please train the model first!")
+            else:
+                spark_df = spark.createDataFrame(news_df)
+                tok = st.session_state["tokenizer"]
+                hash_tf = st.session_state["hashing"]
+                idf_model = st.session_state["idf"]
+                model = st.session_state["model"]
 
-    # Sentiment distribution
-    st.subheader("Sentiment Distribution")
-    st.bar_chart(df["sentiment"].value_counts())
+                tokenized = tok.transform(spark_df)
+                tf_data = hash_tf.transform(tokenized)
+                final_data = idf_model.transform(tf_data)
+                preds = model.transform(final_data).select("headline", "prediction").toPandas()
 
-else:
-    st.warning("⚠️ No news fetched. Check your API key or internet connection.")
+                reverse_map = {2.0: "Positive", 1.0: "Neutral", 0.0: "Negative"}
+                preds["sentiment"] = preds["prediction"].map(reverse_map)
 
+                # Display results
+                st.subheader("Predicted Sentiments")
+                for _, row in preds.iterrows():
+                    st.markdown(f"✅ *{row['headline']}* → {row['sentiment']}")
+                    time.sleep(0.5)
+
+                # Chart
+                st.subheader("Sentiment Distribution")
+                chart_data = preds.groupby("sentiment").size().reset_index(name="count")
+                chart = alt.Chart(chart_data).mark_bar().encode(
+                    x=alt.X("sentiment", sort=["Positive", "Neutral", "Negative"]),
+                    y="count",
+                    color="sentiment"
+                )
+                st.altair_chart(chart, use_container_width=True)
