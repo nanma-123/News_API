@@ -10,106 +10,126 @@ import nltk
 import altair as alt
 import time
 
+# --------------------------
+# Setup
+# --------------------------
 nltk.download("vader_lexicon", quiet=True)
 
-# Cache Spark session
 @st.cache_resource
-def init_spark():
+def get_spark():
     return SparkSession.builder \
-        .appName("NewsSentimentApp") \
+        .appName("NewsSentimentStreaming") \
         .master("local[*]") \
         .config("spark.ui.showConsoleProgress", "false") \
         .getOrCreate()
 
-spark = init_spark()
+spark = get_spark()
+NEWS_API_KEY = st.secrets["NEWS_API_KEY"]
 
-# API Key (replace with st.secrets in production)
-API_KEY = "e35c3d77cbcb402eaadcafbf5bcedac4"
+# --------------------------
+# Helpers
+# --------------------------
+def fetch_news(topic, page_size=5):
+    """Fetch latest news headlines"""
+    url = f"https://newsapi.org/v2/everything?q={topic}&pageSize={page_size}&sortBy=publishedAt&apiKey={NEWS_API_KEY}"
+    r = requests.get(url).json()
+    articles = r.get("articles", [])
+    return pd.DataFrame([{"title": a["title"]} for a in articles if a.get("title")])
 
-# ------------------------------
-# Helper Functions
-# ------------------------------
-def get_news(query, limit=5):
-    """Fetch latest news headlines from News API"""
-    url = f"https://newsapi.org/v2/everything?q={query}&pageSize={limit}&sortBy=publishedAt&apiKey={API_KEY}"
-    resp = requests.get(url).json()
-    articles = resp.get("articles", [])
-    return pd.DataFrame([{"headline": a["title"]} for a in articles if a.get("title")])
-
-def add_sentiment(df):
-    """Classify sentiment using VADER and add labels"""
+def label_sentiment(df_pd):
+    """Apply VADER sentiment + numeric mapping"""
     sia = SentimentIntensityAnalyzer()
     def classify(text):
         score = sia.polarity_scores(text)["compound"]
         return "Positive" if score > 0.05 else "Negative" if score < -0.05 else "Neutral"
-    df["sentiment"] = df["headline"].apply(classify)
-    df["label"] = df["sentiment"].map({"Positive": 2.0, "Neutral": 1.0, "Negative": 0.0})
-    return df
+    df_pd["sentiment"] = df_pd["title"].apply(classify)
+    mapping = {"Positive": 2.0, "Neutral": 1.0, "Negative": 0.0}
+    df_pd["label"] = df_pd["sentiment"].map(mapping)
+    return df_pd
 
-def spark_pipeline(df, mode="train"):
-    """Train or predict sentiment using PySpark pipeline"""
-    if mode == "train":
-        df = add_sentiment(df)
+def train_model(df_pd):
+    """Train logistic regression with Spark"""
+    df_pd = label_sentiment(df_pd)
+    df_spark = spark.createDataFrame(df_pd)
 
-    spark_df = spark.createDataFrame(df)
-    tok = Tokenizer(inputCol="headline", outputCol="tokens")
-    hash_tf = HashingTF(inputCol="tokens", outputCol="tf")
-    idf = IDF(inputCol="tf", outputCol="features")
+    tokenizer = Tokenizer(inputCol="title", outputCol="words")
+    words = tokenizer.transform(df_spark)
 
-    # Tokenize & transform
-    tokenized = tok.transform(spark_df)
-    tf_data = hash_tf.transform(tokenized)
-    final_data = idf.fit(tf_data).transform(tf_data) if mode == "train" else st.session_state["idf"].transform(tf_data)
+    hashingTF = HashingTF(inputCol="words", outputCol="rawFeatures")
+    featurized = hashingTF.transform(words)
 
-    if mode == "train":
-        lr = LogisticRegression(maxIter=10, regParam=0.001)
-        model = lr.fit(final_data)
-        acc = MulticlassClassificationEvaluator(
-            labelCol="label", predictionCol="prediction", metricName="accuracy"
-        ).evaluate(model.transform(final_data))
-        return model, tok, hash_tf, idf.fit(tf_data), acc, df
-    else:
-        model = st.session_state["model"]
-        preds = model.transform(final_data).select("headline", "prediction").toPandas()
-        preds["sentiment"] = preds["prediction"].map({2.0: "Positive", 1.0: "Neutral", 0.0: "Negative"})
-        return preds
+    idf = IDF(inputCol="rawFeatures", outputCol="features")
+    idf_model = idf.fit(featurized)
+    rescaled = idf_model.transform(featurized)
 
-# Streamlit Dashboard
+    lr = LogisticRegression(maxIter=10, regParam=0.001)
+    model = lr.fit(rescaled)
 
-st.set_page_config(page_title="Global News Sentiment", layout="wide")
-st.title("Real-Time Global News Sentiment Dashboard")
+    acc = MulticlassClassificationEvaluator(
+        labelCol="label", predictionCol="prediction", metricName="accuracy"
+    ).evaluate(model.transform(rescaled))
+
+    return model, tokenizer, hashingTF, idf_model, acc, df_pd
+
+def predict_sentiment(df_pd):
+    """Predict sentiment using cached model pipeline"""
+    df_spark = spark.createDataFrame(df_pd)
+    tok = st.session_state["tokenizer"]
+    hashTF = st.session_state["hashingTF"]
+    idf_model = st.session_state["idf_model"]
+    model = st.session_state["model"]
+
+    words = tok.transform(df_spark)
+    feats = hashTF.transform(words)
+    rescaled = idf_model.transform(feats)
+    preds = model.transform(rescaled).select("title", "prediction").toPandas()
+
+    rev_map = {2.0: "Positive", 1.0: "Neutral", 0.0: "Negative"}
+    preds["sentiment"] = preds["prediction"].map(rev_map)
+    return preds
+
+# --------------------------
+# Dashboard
+# --------------------------
+st.set_page_config(page_title="News Sentiment Dashboard", page_icon="📰", layout="wide")
+st.title("Real-Time News Sentiment with PySpark")
 
 # Sidebar
 st.sidebar.header("🔧 Controls")
-query = st.sidebar.text_input("Enter Topic", "Climate Change")
-mode = st.sidebar.radio("Choose Mode", ["Train Model", "Predict Sentiment"])
-limit = st.sidebar.slider("Number of Articles", 5, 25, 10)
+topic = st.sidebar.text_input("Enter Topic", "Climate Change")
+mode = st.sidebar.radio("Mode", ["Bootstrap (Train)", "Predict"])
+num_articles = st.sidebar.slider("Articles", 3, 20, 8)
 
-if st.sidebar.button("Run Analysis"):
-    news_df = get_news(query, limit)
-    if news_df.empty:
-        st.warning("No news articles found.")
+if st.sidebar.button("🚀 Run"):
+    df_pd = fetch_news(topic, num_articles)
+
+    if df_pd.empty:
+        st.error("⚠️ No news found.")
     else:
-        if mode == "Train Model":
-            model, tok, hash_tf, idf, acc, train_df = spark_pipeline(news_df, mode="train")
-            st.session_state.update({"model": model, "tokenizer": tok, "hashing": hash_tf, "idf": idf})
+        if mode == "Bootstrap (Train)":
+            model, tok, hashTF, idf_model, acc, df_pd = train_model(df_pd)
 
-            st.success(f"Model trained! Accuracy: {acc:.2%}")
-            st.subheader("Training Data with VADER Labels")
-            st.dataframe(train_df[["headline", "sentiment"]])
+            st.session_state.update({
+                "model": model, "tokenizer": tok,
+                "hashingTF": hashTF, "idf_model": idf_model
+            })
 
-        elif mode == "Predict Sentiment":
+            st.success(f"Model trained successfully! Accuracy: {acc:.2%}")
+            st.subheader("Training Data (with VADER Labels)")
+            st.dataframe(df_pd[["title", "sentiment"]])
+
+        elif mode == "Predict":
             if "model" not in st.session_state:
-                st.error("Please train the model first!")
+                st.error("Please bootstrap (train) first!")
             else:
-                preds = spark_pipeline(news_df, mode="predict")
+                preds = predict_sentiment(df_pd)
 
-                st.subheader("Predicted Sentiments")
+                st.subheader("Predictions")
                 for _, row in preds.iterrows():
-                    st.markdown(f"- **{row['headline']}** →  {row['sentiment']}")
-                    time.sleep(0.2)
+                    st.markdown(f"- **{row['title']}** → 🎯 {row['sentiment']}")
+                    time.sleep(0.3)
 
-                # Distribution Chart
+                # Sentiment distribution chart
                 st.subheader("Sentiment Distribution")
                 chart_data = preds.groupby("sentiment").size().reset_index(name="count")
                 chart = alt.Chart(chart_data).mark_arc(innerRadius=50).encode(
