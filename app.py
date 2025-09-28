@@ -25,7 +25,7 @@ def get_spark():
 spark = get_spark()
 
 # Get API key from secrets
-NEWS_API_KEY = st.secrets["NEWS_API_KEY"]
+NEWS_API_KEY ="e35c3d77cbcb402eaadcafbf5bcedac4"
 
 # Fetch news from NewsAPI
 def fetch_news(topic, page_size=5):
