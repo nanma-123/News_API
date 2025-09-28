@@ -1,11 +1,7 @@
+streamlit
+requests
+transformers
+scikit-learn
+pandas
 pyspark
 nltk
-altair
-pandas
-requests
-streamlit==1.38.0
-pyspark==3.5.1
-pandas==2.2.2
-nltk==3.9.1
-altair==5.4.1
-requests==2.32.3
