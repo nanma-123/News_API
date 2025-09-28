@@ -10,11 +10,10 @@ import nltk
 import altair as alt
 import time
 
-# --------------------------
-# Setup
-# --------------------------
-nltk.download("vader_lexicon", quiet=True)
+# Download VADER lexicon (only once)
+nltk.download('vader_lexicon')
 
+# Spark session caching
 @st.cache_resource
 def get_spark():
     return SparkSession.builder \
@@ -24,115 +23,119 @@ def get_spark():
         .getOrCreate()
 
 spark = get_spark()
+
+# Get API key from secrets
 NEWS_API_KEY = st.secrets["NEWS_API_KEY"]
 
-# --------------------------
-# Helpers
-# --------------------------
+# Fetch news from NewsAPI
 def fetch_news(topic, page_size=5):
-    """Fetch latest news headlines"""
     url = f"https://newsapi.org/v2/everything?q={topic}&pageSize={page_size}&sortBy=publishedAt&apiKey={NEWS_API_KEY}"
-    r = requests.get(url).json()
-    articles = r.get("articles", [])
+    r = requests.get(url)
+    articles = r.json().get("articles", [])
     return pd.DataFrame([{"title": a["title"]} for a in articles if a.get("title")])
 
+# Sentiment labeling with VADER
 def label_sentiment(df_pd):
-    """Apply VADER sentiment + numeric mapping"""
     sia = SentimentIntensityAnalyzer()
-    def classify(text):
-        score = sia.polarity_scores(text)["compound"]
-        return "Positive" if score > 0.05 else "Negative" if score < -0.05 else "Neutral"
-    df_pd["sentiment"] = df_pd["title"].apply(classify)
-    mapping = {"Positive": 2.0, "Neutral": 1.0, "Negative": 0.0}
-    df_pd["label"] = df_pd["sentiment"].map(mapping)
+    def classify_title(title):
+        score = sia.polarity_scores(title)["compound"]
+        if score > 0.05:
+            return "Positive"
+        elif score < -0.05:
+            return "Negative"
+        else:
+            return "Neutral"
+    df_pd["sentiment"] = df_pd["title"].apply(classify_title)
+    # Map to numeric labels for Spark ML
+    label_map = {"Positive": 2.0, "Neutral": 1.0, "Negative": 0.0}
+    df_pd["label"] = df_pd["sentiment"].map(label_map)
     return df_pd
 
-def train_model(df_pd):
-    """Train logistic regression with Spark"""
-    df_pd = label_sentiment(df_pd)
-    df_spark = spark.createDataFrame(df_pd)
+# Streamlit UI
+st.title("📰 PySpark News Sentiment Dashboard")
 
-    tokenizer = Tokenizer(inputCol="title", outputCol="words")
-    words = tokenizer.transform(df_spark)
+topic = st.text_input("Topic", "technology")
+mode = st.radio("Mode", ["Bootstrap", "Predict"])
+num_articles = st.slider("Number of articles", 3, 20, 5)
 
-    hashingTF = HashingTF(inputCol="words", outputCol="rawFeatures")
-    featurized = hashingTF.transform(words)
-
-    idf = IDF(inputCol="rawFeatures", outputCol="features")
-    idf_model = idf.fit(featurized)
-    rescaled = idf_model.transform(featurized)
-
-    lr = LogisticRegression(maxIter=10, regParam=0.001)
-    model = lr.fit(rescaled)
-
-    acc = MulticlassClassificationEvaluator(
-        labelCol="label", predictionCol="prediction", metricName="accuracy"
-    ).evaluate(model.transform(rescaled))
-
-    return model, tokenizer, hashingTF, idf_model, acc, df_pd
-
-def predict_sentiment(df_pd):
-    """Predict sentiment using cached model pipeline"""
-    df_spark = spark.createDataFrame(df_pd)
-    tok = st.session_state["tokenizer"]
-    hashTF = st.session_state["hashingTF"]
-    idf_model = st.session_state["idf_model"]
-    model = st.session_state["model"]
-
-    words = tok.transform(df_spark)
-    feats = hashTF.transform(words)
-    rescaled = idf_model.transform(feats)
-    preds = model.transform(rescaled).select("title", "prediction").toPandas()
-
-    rev_map = {2.0: "Positive", 1.0: "Neutral", 0.0: "Negative"}
-    preds["sentiment"] = preds["prediction"].map(rev_map)
-    return preds
-
-# --------------------------
-# Dashboard
-# --------------------------
-st.set_page_config(page_title="News Sentiment Dashboard", page_icon="📰", layout="wide")
-st.title("Real-Time News Sentiment with PySpark")
-
-# Sidebar
-st.sidebar.header("🔧 Controls")
-topic = st.sidebar.text_input("Enter Topic", "Climate Change")
-mode = st.sidebar.radio("Mode", ["Bootstrap (Train)", "Predict"])
-num_articles = st.sidebar.slider("Articles", 3, 20, 8)
-
-if st.sidebar.button("🚀 Run"):
+if st.button("Run"):
     df_pd = fetch_news(topic, num_articles)
-
     if df_pd.empty:
-        st.error("⚠️ No news found.")
+        st.error("No news found.")
     else:
-        if mode == "Bootstrap (Train)":
-            model, tok, hashTF, idf_model, acc, df_pd = train_model(df_pd)
+        if mode == "Bootstrap":
+            # Label data
+            df_pd = label_sentiment(df_pd)
+            df_spark = spark.createDataFrame(df_pd)
 
+            # Spark ML Pipeline
+            tokenizer = Tokenizer(inputCol="title", outputCol="words")
+            words_data = tokenizer.transform(df_spark)
+
+            hashingTF = HashingTF(inputCol="words", outputCol="rawFeatures")
+            featurized_data = hashingTF.transform(words_data)
+
+            idf = IDF(inputCol="rawFeatures", outputCol="features")
+            idf_model = idf.fit(featurized_data)
+            rescaled_data = idf_model.transform(featurized_data)
+
+            lr = LogisticRegression(maxIter=10, regParam=0.001)
+            model = lr.fit(rescaled_data)
+
+            # Training accuracy
+            evaluator = MulticlassClassificationEvaluator(
+                labelCol="label", predictionCol="prediction", metricName="accuracy")
+            train_accuracy = evaluator.evaluate(model.transform(rescaled_data))
+
+            # Store in session
             st.session_state.update({
-                "model": model, "tokenizer": tok,
-                "hashingTF": hashTF, "idf_model": idf_model
+                "model": model,
+                "tokenizer": tokenizer,
+                "hashingTF": hashingTF,
+                "idf_model": idf_model
             })
 
-            st.success(f"Model trained successfully! Accuracy: {acc:.2%}")
-            st.subheader("Training Data (with VADER Labels)")
-            st.dataframe(df_pd[["title", "sentiment"]])
+            st.success("Model trained successfully!")
+            st.info(f"Training Accuracy: {train_accuracy:.2%}")
+            st.subheader("Bootstrap Data")
+            st.write(df_pd[["title", "sentiment"]])
 
         elif mode == "Predict":
             if "model" not in st.session_state:
-                st.error("Please bootstrap (train) first!")
+                st.error("Run Bootstrap first!")
             else:
-                preds = predict_sentiment(df_pd)
+                # Convert new data to Spark DataFrame
+                df_spark = spark.createDataFrame(df_pd)
+
+                # Transform data using cached pipeline
+                tokenizer = st.session_state["tokenizer"]
+                hashingTF = st.session_state["hashingTF"]
+                idf_model = st.session_state["idf_model"]
+                model = st.session_state["model"]
+
+                words_data = tokenizer.transform(df_spark)
+                featurized_data = hashingTF.transform(words_data)
+                rescaled_data = idf_model.transform(featurized_data)
+                predictions = model.transform(rescaled_data)
+
+                predictions_df = predictions.select("title", "prediction").toPandas()
+                label_map_reverse = {2.0: "Positive", 1.0: "Neutral", 0.0: "Negative"}
+                predictions_df["sentiment"] = predictions_df["prediction"].map(label_map_reverse)
 
                 st.subheader("Predictions")
-                for _, row in preds.iterrows():
-                    st.markdown(f"- **{row['title']}** → 🎯 {row['sentiment']}")
-                    time.sleep(0.3)
+                st.write(predictions_df[["title", "sentiment"]])
 
-                # Sentiment distribution chart
-                st.subheader("Sentiment Distribution")
-                chart_data = preds.groupby("sentiment").size().reset_index(name="count")
-                chart = alt.Chart(chart_data).mark_arc(innerRadius=50).encode(
-                    theta="count", color="sentiment", tooltip=["sentiment", "count"]
+                # Real-time streaming simulation (display each row with delay)
+                st.subheader("Streaming Simulation")
+                for idx, row in predictions_df.iterrows():
+                    st.write(f"**{row['title']}** → {row['sentiment']}")
+                    time.sleep(0.5)
+
+                # Altair bar chart for sentiment distribution
+                chart_data = predictions_df.groupby("sentiment").size().reset_index(name='count')
+                chart = alt.Chart(chart_data).mark_bar().encode(
+                    x='sentiment',
+                    y='count',
+                    color='sentiment'
                 )
                 st.altair_chart(chart, use_container_width=True)
