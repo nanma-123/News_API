@@ -9,6 +9,7 @@ from nltk.sentiment.vader import SentimentIntensityAnalyzer
 import nltk
 import altair as alt
 import time
+from pyspark.sql import SparkSession
 
 # Download VADER lexicon
 nltk.download("vader_lexicon", quiet=True)
