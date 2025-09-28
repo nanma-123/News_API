@@ -8,6 +8,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
 import altair as alt
 import time
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # Download VADER lexicon (only once)
 nltk.download("vader_lexicon")
