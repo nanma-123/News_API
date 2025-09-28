@@ -4,4 +4,4 @@ requests
 nltk
 scikit-learn
 altair
-
+pyspark
