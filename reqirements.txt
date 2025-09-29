@@ -1,7 +1,0 @@
-streamlit
-pandas
-requests
-nltk
-scikit-learn
-altair
-pyspark
