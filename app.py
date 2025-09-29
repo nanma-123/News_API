@@ -29,7 +29,7 @@ spark_session = init_spark()
 # ------------------------
 # API Key
 # ------------------------
-NEWSAPI_KEY = "e35c3d77cbcb402eaadcafbf5bcedac4"
+NEWSAPI_KEY = "NEWS_API_KEY"
 
 # ------------------------
 # Fetch news function
